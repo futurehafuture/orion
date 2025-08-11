@@ -59,15 +59,6 @@ class OrionSystem(nn.Module):
         # 生成式规划器
         self.trajectory_planner = ConditionalTrajectoryVAE(config.planner)
         
-        # 规划token融合模块
-        self.planning_fusion = nn.Sequential(
-            nn.Linear(config.qt_former.token_dim + config.llm.token_dim, config.planner.token_dim),
-            nn.LayerNorm(config.planner.token_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(config.planner.token_dim, config.planner.token_dim)
-        )
-        
         # 时序一致性模块
         self.temporal_consistency = nn.Sequential(
             nn.Linear(config.planner.token_dim * 2, config.planner.token_dim),
@@ -114,29 +105,28 @@ class OrionSystem(nn.Module):
         if self.prev_planning_token.size(0) != batch_size:
             self.prev_planning_token = self.prev_planning_token.expand(batch_size, -1).contiguous()
         
-        # Step 1: 视觉特征提取
-        vision_features = self.vision_backbone(batch["image"])  # (B, D_vision)
+        # Step 1: 视觉特征提取（提供patch token以提升细粒度对齐）
+        vision_features, patch_tokens = self.vision_backbone(batch["image"], return_patches=True)  # (B, D), (B, N, D)
         
-        # Step 2: QT-Former时序建模
-        llm_tokens, qt_planning_token = self.qt_former(vision_features)  # (B, Q, D), (B, D)
+        # Step 2: QT-Former时序建模（返回历史/场景LLM标记与规划token）
+        x_h, x_s, _ = self.qt_former(vision_features, patch_tokens)  # qt_planning_token is no longer used here
+        # 组装给LLM的视觉token序列（场景在前，历史在后）
+        llm_tokens = torch.cat([x_s, x_h], dim=1)
         
         # Step 3: LLM推理
         text_input = batch.get("text_prompt", None)
         llm_outputs = self.llm(llm_tokens, text_input)
-        llm_planning_token = llm_outputs["planning_token"]  # (B, D)
+        planning_token = llm_outputs["planning_token"]  # (B, D_planner) - This is the primary planning token now
         
         # Step 4: VQA预测
-        vqa_outputs = self.vqa_head(llm_outputs.get("scene_features", llm_planning_token))
+        vqa_outputs = self.vqa_head(llm_outputs.get("vqa_logits"))
         
-        # Step 5: 规划token融合
-        fused_planning_token = self.planning_fusion(
-            torch.cat([qt_planning_token, llm_planning_token], dim=-1)
-        )  # (B, D_planner)
+        # Step 5: (Removed) 规划token融合 is no longer needed
         
         # Step 6: 时序一致性检查
         if hasattr(self, 'prev_planning_token') and self.prev_planning_token.numel() > 0:
             consistency_input = torch.cat([
-                fused_planning_token, self.prev_planning_token
+                planning_token, self.prev_planning_token
             ], dim=-1)
             temporal_consistency = self.temporal_consistency(consistency_input)
         else:
@@ -146,28 +136,26 @@ class OrionSystem(nn.Module):
         if training and "trajectory" in batch:
             # 训练模式：使用目标轨迹
             planning_outputs = self.trajectory_planner(
-                batch["trajectory"], fused_planning_token, training=True
+                batch["trajectory"], planning_token, training=True
             )
         else:
             # 推理模式：从先验采样
             planning_outputs = {}
             sampled_trajectories = self.trajectory_planner.sample(
-                fused_planning_token, num_samples=5
+                planning_token, num_samples=5
             )  # (B, 5, T, 2)
             planning_outputs["sampled_trajectories"] = sampled_trajectories
             planning_outputs["best_trajectory"] = sampled_trajectories[:, 0]  # 选择第一个
         
         # 更新历史规划token
-        self.prev_planning_token = fused_planning_token.detach()
+        self.prev_planning_token = planning_token.detach()
         
         # 整合所有输出
         outputs = {
             # 特征表示
             "vision_features": vision_features,
             "llm_tokens": llm_tokens,
-            "qt_planning_token": qt_planning_token,
-            "llm_planning_token": llm_planning_token,
-            "fused_planning_token": fused_planning_token,
+            "planning_token": planning_token,
             
             # VQA输出
             **{f"vqa_{k}": v for k, v in vqa_outputs.items()},
@@ -179,6 +167,11 @@ class OrionSystem(nn.Module):
             "temporal_consistency": temporal_consistency,
             "training": training
         }
+
+        # 附加QT-Former辅助输出
+        if hasattr(self.qt_former, '_aux_outputs'):
+            for k, v in self.qt_former._aux_outputs.items():
+                outputs[f"qt_{k}"] = v
         
         # 添加LLM的其他输出
         for key, value in llm_outputs.items():
@@ -271,7 +264,7 @@ class OrionSystem(nn.Module):
             outputs = self.forward(batch, training=False)
             
             # 生成多个轨迹
-            planning_token = outputs["fused_planning_token"]
+            planning_token = outputs["planning_token"]
             trajectories = self.trajectory_planner.sample(
                 planning_token, num_samples=num_trajectories
             )  # (B, num_trajectories, T, 2)
@@ -329,7 +322,7 @@ class OrionSystem(nn.Module):
             for task_type in ["scene_classification", "weather_detection", "traffic_light", "driving_intent"]:
                 if f"vqa_{task_type}_logits" in outputs:
                     explanation = self.vqa_head.explain_prediction(
-                        outputs["llm_planning_token"], task_type
+                        outputs["llm_vqa_logits"], task_type
                     )
                     vqa_explanations[task_type] = explanation
             
@@ -339,8 +332,7 @@ class OrionSystem(nn.Module):
             # 特征重要性
             feature_importance = {
                 "vision_features_norm": torch.norm(outputs["vision_features"], dim=-1).cpu().numpy(),
-                "qt_token_importance": torch.norm(outputs["qt_planning_token"], dim=-1).cpu().numpy(),
-                "llm_token_importance": torch.norm(outputs["llm_planning_token"], dim=-1).cpu().numpy(),
+                "planning_token_importance": torch.norm(outputs["planning_token"], dim=-1).cpu().numpy(),
             }
             
             return {

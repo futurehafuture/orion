@@ -19,12 +19,23 @@ class QTFormerConfig:
     """QT-Former配置"""
     vision_dim: int = 512
     token_dim: int = 512
+    # 查询数量
+    num_scene_queries: int = 4
+    num_perception_queries: int = 4
     num_history_queries: int = 8
     memory_size: int = 64
     num_heads: int = 8
     num_layers: int = 2
     dropout: float = 0.1
     memory_update_rate: float = 0.1
+    # 位置与时间嵌入
+    use_time_embedding: bool = True
+    use_pos3d_embedding: bool = False
+    # 感知辅助头配置
+    traffic_state_classes: int = 4
+    num_detection_slots: int = 10
+    detection_num_classes: int = 8
+    num_agents: int = 5
 
 
 @dataclass

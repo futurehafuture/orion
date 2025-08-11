@@ -3,7 +3,7 @@
 import torch
 import torch.nn as nn
 import torchvision.models as models
-from typing import Dict, Any
+from typing import Dict, Any, Tuple
 
 from ...config.model_configs import VisionConfig
 
@@ -74,7 +74,7 @@ class VisionBackbone(nn.Module):
             for param in layer.parameters():
                 param.requires_grad = False
     
-    def forward(self, images: torch.Tensor) -> torch.Tensor:
+    def forward(self, images: torch.Tensor, return_patches: bool = False) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
         """
         前向传播
         
@@ -87,15 +87,22 @@ class VisionBackbone(nn.Module):
         # 特征提取
         x = self.backbone(images)  # (B, backbone_dim, H', W') or (B, backbone_dim)
         
-        # 全局平均池化（如果需要）
-        if x.dim() > 2:
-            x = torch.adaptive_avg_pool2d(x, (1, 1))
-            x = x.flatten(1)
-        
-        # 特征投影
-        features = self.feature_proj(x)
-        
-        return features
+        if return_patches and x.dim() == 4:
+            # 返回patch token：(B, N, C)
+            B, C, H, W = x.shape
+            patches = x.view(B, C, H * W).permute(0, 2, 1)  # (B, N, C)
+            patches = self.feature_proj(patches)
+            # 同时返回全局向量
+            pooled = torch.adaptive_avg_pool2d(x, (1, 1)).flatten(1)
+            global_feat = self.feature_proj(pooled)
+            return global_feat, patches
+        else:
+            # 全局平均池化
+            if x.dim() > 2:
+                x = torch.adaptive_avg_pool2d(x, (1, 1))
+                x = x.flatten(1)
+            features = self.feature_proj(x)
+            return features
     
     def get_feature_dim(self) -> int:
         """获取输出特征维度"""

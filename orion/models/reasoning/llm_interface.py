@@ -13,6 +13,11 @@ try:
         AutoTokenizer,
         GenerationConfig
     )
+    from peft import (
+        LoraConfig,
+        get_peft_model,
+        TaskType
+    )
     _HF_AVAILABLE = True
 except ImportError:
     _HF_AVAILABLE = False
@@ -216,68 +221,98 @@ class HuggingFaceLLM(LLMInterface):
         # 设置pad token
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+            
+        # Freeze the base model and apply LoRA
+        self._setup_lora()
+
+    def _setup_lora(self):
+        """Freezes the base model and applies LoRA configuration."""
+        
+        # Freeze all parameters of the base model
+        for param in self.model.parameters():
+            param.requires_grad = False
+            
+        # LoRA configuration
+        lora_config = LoraConfig(
+            r=self.config.lora_r,
+            lora_alpha=self.config.lora_alpha,
+            lora_dropout=self.config.lora_dropout,
+            bias="none",
+            task_type=TaskType.CAUSAL_LM,
+            target_modules=self.config.lora_target_modules
+        )
+        
+        # Apply LoRA to the model
+        self.model = get_peft_model(self.model, lora_config)
+        self.model.print_trainable_parameters()
     
     def forward(self, visual_tokens: torch.Tensor,
                 text_input: Optional[str] = None) -> Dict[str, torch.Tensor]:
         """
         Args:
-            visual_tokens: (B, Q, D) 视觉token
-            text_input: 可选的文本输入
+            visual_tokens: (B, Q, D) 视觉token from QT-Former (x_s, x_h)
+            text_input: (B, length) list of instruction strings
             
         Returns:
             包含planning_token、vqa_logits等的字典
         """
         B, Q, D = visual_tokens.shape
         
-        # 投影视觉token到模型空间
+        # Project visual tokens to the model's hidden space
         visual_embeds = self.vision_proj(visual_tokens)  # (B, Q, hidden_dim)
         
-        # 准备文本输入
+        # Prepare text input
         if text_input is None:
-            text_input = "Analyze the driving scene and provide planning guidance."
+            # Create a batch of default prompts if none provided
+            text_input = ["Analyze the driving scene and provide planning guidance."] * B
         
-        # 编码文本
+        # Tokenize text inputs
         text_inputs = self.tokenizer(
-            [text_input] * B,
+            text_input,
             return_tensors="pt",
-            padding=True,
+            padding='longest', # Use 'longest' to pad to the longest sequence in the batch
             truncation=True,
             max_length=self.config.max_sequence_length - Q
         )
         text_inputs = {k: v.to(visual_tokens.device) for k, v in text_inputs.items()}
         
-        # 获取文本嵌入
-        text_embeds = self.model.get_input_embeddings()(text_inputs["input_ids"])
+        # Get text embeddings
+        text_embeds = self.model.get_input_embeddings()(text_inputs["input_ids"]) # (B, T, hidden_dim)
         
-        # 融合视觉和文本嵌入
-        combined_embeds = torch.cat([visual_embeds, text_embeds], dim=1)
+        # Concatenate visual and text embeddings
+        combined_embeds = torch.cat([visual_embeds, text_embeds], dim=1) # (B, Q+T, hidden_dim)
         
-        # 前向传播
+        # Create attention mask
+        visual_attn_mask = torch.ones(B, Q, device=visual_tokens.device)
+        text_attn_mask = text_inputs["attention_mask"]
+        combined_attn_mask = torch.cat([visual_attn_mask, text_attn_mask], dim=1)
+        
+        # Forward pass through the model
         outputs = self.model(
             inputs_embeds=combined_embeds,
-            attention_mask=torch.ones(
-                B, combined_embeds.size(1),
-                device=visual_tokens.device
-            ),
+            attention_mask=combined_attn_mask,
             output_hidden_states=True
         )
         
-        # 获取最后一层隐藏状态
+        # Extract features
         last_hidden = outputs.hidden_states[-1]  # (B, seq_len, hidden_dim)
         
-        # 聚合特征（使用视觉部分的平均）
-        visual_part = last_hidden[:, :Q, :]  # (B, Q, hidden_dim)
-        pooled = visual_part.mean(dim=1)  # (B, hidden_dim)
+        # The planning token is the embedding corresponding to the first visual token
+        planning_token_embed = last_hidden[:, 0, :] # Use the first token as the planning token
         
-        # 生成输出
-        planning_token = self.planning_proj(pooled)
-        vqa_logits = self.vqa_proj(pooled)
+        # Aggregate features from other visual tokens for VQA
+        vqa_embeds = last_hidden[:, 1:Q, :] # Other visual tokens
+        pooled_vqa = vqa_embeds.mean(dim=1)  # (B, hidden_dim)
+        
+        # Project to output spaces
+        planning_token = self.planning_proj(planning_token_embed)
+        vqa_logits = self.vqa_proj(pooled_vqa)
         
         return {
             "planning_token": planning_token,
             "vqa_logits": vqa_logits,
             "hidden_states": last_hidden,
-            "visual_features": visual_part
+            "visual_features": last_hidden[:, :Q, :]
         }
     
     def generate_response(self, visual_tokens: torch.Tensor,
@@ -315,14 +350,16 @@ class HuggingFaceLLM(LLMInterface):
         # 解码响应
         responses = []
         for output in outputs:
-            # 跳过输入部分
-            response_ids = output[combined_embeds.size(1):]
+            # Skip the input part of the generated sequence
+            response_ids = output[prompt_embeds.size(1):]
             response = self.tokenizer.decode(response_ids, skip_special_tokens=True)
             responses.append(response.strip())
         
         return responses
     
+    
     def freeze_llm(self):
-        """冻结LLM参数，只训练投影层"""
-        for param in self.model.parameters():
-            param.requires_grad = False
+        """DEPRECATED: Freezing is now handled by PEFT during initialization."""
+        pass
+        # for param in self.model.parameters():
+        #     param.requires_grad = False
